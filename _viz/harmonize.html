@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<meta charset="utf-8">
+<title>DeepBach Harmonization</title>
+<style>
+  :root { color-scheme: light dark;
+          --bg:#f9f9f7; --card:#fcfcfb; --ink:#0b0b0b; --muted:#898781;
+          --grid:#e1e0d9; --fixed:#2a78d6; --gen:#eb6834; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0d0d0d; --card:#1a1a19; --ink:#ffffff; --muted:#898781;
+            --grid:#2c2c2a; --fixed:#3987e5; --gen:#d95926; }
+  }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--ink);
+         font:14px system-ui, -apple-system, "Segoe UI", sans-serif; }
+  h1 { font-size:15px; margin:0 0 2px; }
+  p  { margin:0 0 12px; color:var(--muted); font-size:12px; }
+  #wrap { overflow-x:auto; background:var(--card); border-radius:8px; }
+  canvas { display:block; }
+  #bar { display:flex; align-items:center; gap:12px; margin-top:12px; }
+  input[type=range] { flex:1; }
+  #at { font-variant-numeric:tabular-nums; color:var(--muted); min-width:15ch; }
+  /* Which arm the current payload belongs to. */
+  #arm { display:none; margin-left:8px; padding:1px 8px; border-radius:999px;
+         background:#eb683426; color:#a83c14; font-size:11px; font-weight:600;
+         letter-spacing:.2px; vertical-align:1px; }
+  #arm.rnn-gru { background:#7b5cd626; color:#5b3fb0; }
+  #err { display:none; margin:0 0 12px; padding:10px 12px; border-radius:8px;
+         background:#fdecea; color:#8a1c10; font-size:12px; line-height:1.6; }
+  #err code { background:#00000012; padding:1px 4px; border-radius:3px; }
+  @media (prefers-color-scheme: dark) {
+    #arm { background:#d9592633; color:#f0a184; }
+    #arm.rnn-gru { background:#7b5cd633; color:#b9a6f0; }
+    #err { background:#3a1512; color:#ffb4a8; }
+    #err code { background:#ffffff1a; }
+  }
+</style>
+<h1>DeepBach harmonization<span id="arm"></span></h1>
+<p id="sub"></p>
+<div id="err"></div>
+<div id="wrap"><canvas id="roll"></canvas></div>
+<div id="bar"><input type="range" id="slider" min="0" value="0"><span id="at"></span></div>
+
+<script>
+// Static page: it holds no sampling data itself; everything drawn comes from the payload
+// `_viz_harmonize.py` writes beside it:
+//   { meta: {...},
+//     vocab: [ { <tok>: {midi:int} | {sym:'slur'|'rest'|'oor'|'unknown'} } ],  // per voice
+//     frames: [ { i:int, v:[[one token per tick] * 4], c:[float|null] * 4 } ] }
+// `meta`'s arch / rc / rnn_type plus `arm_text` say which arm this is, so one page serves
+// baseline, shared trunk (rc/norc) and GRU. Structural changes must sync `write_payload()`.
+//
+// Two loading paths (under `file://` a browser refuses to fetch a sibling file):
+//   served       ->  fetch('frames.json')      also readable by jq/python
+//   double-click ->  <script src="frames.js">  the same JSON, on window.__FRAMES__
+// Both come out of one json.dumps.
+
+// Payload-derived state: declared here, filled in by init().
+let D, M, V, NV, TOTAL, PAD_L, rollW, rollH, lo, hi;
+
+const LANE = 54, GAP = 6, PAD_T = 6, X = 3, AXIS = 16;
+const FONT = '11px system-ui, sans-serif';
+const nameOf = v => V[v] + (M.generated_voices.includes(v) ? '' : ' (fixed)');
+
+// Left margin = the longer of the "voice name" and "conf 0.00" rows; both are measured.
+const _m = document.createElement('canvas').getContext('2d');
+_m.font = FONT;
+
+const roll = document.getElementById('roll');
+const dpr = window.devicePixelRatio || 1;
+const g = roll.getContext('2d');
+// canvas fillStyle does not take CSS variables, so they must be resolved first.
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+// One vocab index row -> [startTick, endTick, midi] segments. 'slur' extends the previous
+// note, a rest breaks the run, 'oor' has no pitch so midi is null.
+function runs(v, row) {
+  const out = []; let cur = null;
+  const flush = () => { if (cur) { out.push(cur); cur = null; } };
+  row.forEach((idx, t) => {
+    const e = D.vocab[v][idx];
+    if (e && e.sym === 'slur') { if (cur) cur[1] = t + 1; return; }
+    flush();
+    if (e && e.midi !== undefined) cur = [t, t + 1, e.midi];
+    else if (e && e.sym === 'oor') out.push([t, t + 1, null]);
+  });
+  flush();
+  return out;
+}
+
+function draw() {
+  const frame = D.frames[+document.getElementById('slider').value];
+  g.clearRect(0, 0, rollW, rollH);
+  g.font = FONT;
+
+  for (let b = 0; b * M.ticks_per_bar <= TOTAL; b++) {
+    const x = PAD_L + b * M.ticks_per_bar * X;
+    g.strokeStyle = css('--grid'); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(x + .5, 0); g.lineTo(x + .5, rollH - AXIS); g.stroke();
+    if (b % 4 === 0) {
+      g.fillStyle = css('--muted'); g.textAlign = 'center'; g.textBaseline = 'top';
+      g.fillText(b + 1, x, rollH - AXIS + 3);
+    }
+  }
+
+  const fixed = v => !M.generated_voices.includes(v);
+  for (let v = 0; v < NV; v++) {
+    const top = PAD_T + v * (LANE + GAP);
+    g.textAlign = 'right'; g.textBaseline = 'middle';
+    // Two rows: voice name + this frame's conf; frame.c is per voice, unsampled = null.
+    g.fillStyle = css('--ink');
+    g.fillText(nameOf(v), PAD_L - 8, top + LANE / 2 - 7);
+    g.fillStyle = css('--muted');
+    g.fillText('conf ' + (frame.c[v] == null ? '—' : frame.c[v].toFixed(2)),
+               PAD_L - 8, top + LANE / 2 + 7);
+    g.fillStyle = css(fixed(v) ? '--fixed' : '--gen');
+    const span = Math.max(1, hi[v] - lo[v]);
+    for (const [a, b, m] of runs(v, frame.v[v])) {
+      const w = Math.max(2, (b - a) * X - 1);
+      if (m === null) { g.fillRect(PAD_L + a * X, top + LANE / 2 - 1, w, 2); continue; }
+      const y = top + LANE - 4 - (m - lo[v]) / span * (LANE - 8);
+      g.fillRect(PAD_L + a * X, y, w, 4);
+    }
+  }
+  document.getElementById('at').textContent =
+    frame.i < 0 ? 'random init' : 'iteration ' + (frame.i + 1) + ' / ' + M.iterations;
+}
+
+function showError(detail) {
+  const el = document.getElementById('err');
+  el.innerHTML = '<b>Nothing to draw.</b> Neither <code>frames.json</code> nor '
+    + '<code>frames.js</code> could be loaded from this page\'s folder.<br>'
+    + 'Opened straight off disk (<code>file://</code>), a browser will not read a '
+    + 'sibling file — run <code>python _viz\\_viz_harmonize.py</code> once to write '
+    + 'them, then reload. Or serve the folder: <code>python -m http.server -d _viz 8000</code> '
+    + 'and open <code>http://localhost:8000/harmonize.html</code>.<br>'
+    + '<span style="opacity:.65">' + String(detail) + '</span>';
+  el.style.display = 'block';
+}
+
+function init(payload) {
+  D = payload;
+  M = D.meta; V = M.voice_names; NV = M.num_voices;
+  TOTAL = M.total_ticks;
+
+  // Arm chip: prefer `arm_text` from the payload, else join arch/rnn_type, else nothing.
+  const armEl = document.getElementById('arm');
+  const arm = M.arm_text || [M.arch, M.rnn_type].filter(Boolean).join(' · ');
+  if (arm) {
+    armEl.textContent = arm;
+    if (M.rnn_type === 'gru') armEl.className = 'rnn-gru';
+    armEl.style.display = 'inline-block';
+  }
+
+  PAD_L = 10 + Math.ceil(Math.max(
+    ...V.map((_, v) => _m.measureText(nameOf(v)).width),
+    _m.measureText('conf 0.00').width));
+
+  rollW = PAD_L + TOTAL * X + 6;
+  rollH = PAD_T + NV * (LANE + GAP) + AXIS;
+  roll.width = rollW * dpr; roll.height = rollH * dpr;
+  roll.style.width = rollW + 'px'; roll.style.height = rollH + 'px';
+  g.scale(dpr, dpr);
+
+  // A pitch axis per voice, from the pitches that voice actually uses.
+  lo = []; hi = [];
+  for (let v = 0; v < NV; v++) {
+    let a = Infinity, b = -Infinity;
+    for (const f of D.frames) for (const i of f.v[v]) {
+      const e = D.vocab[v][i];
+      if (e && e.midi !== undefined) { a = Math.min(a, e.midi); b = Math.max(b, e.midi); }
+    }
+    lo[v] = a; hi[v] = b;
+  }
+
+  const oor = D.frames.some(f => f.v.some((row, v) =>
+    row.some(i => D.vocab[v][i] && D.vocab[v][i].sym === 'oor')));
+  document.getElementById('sub').textContent =
+    M.source + ' · ' + M.iterations + ' iterations · temperature '
+    + M.temperature + ' requested, ' + M.actual_temp.toFixed(4) + ' reached'
+    + ' · conf = mean top-choice probability of the model, over the '
+    + M.batch_per_voice + ' ticks it sampled that iteration'
+    + (oor ? ' · the 2px dashes mark out-of-range notes (pitch lost)' : '');
+
+  const slider = document.getElementById('slider');
+  slider.max = D.frames.length - 1;
+  slider.value = 0;
+  slider.addEventListener('input', draw);
+  draw();
+}
+
+// `file://` fallback: `<script src>` is not subject to fetch's CORS restriction.
+function loadFramesJs() {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'frames.js';
+    s.onload = () => window.__FRAMES__
+      ? resolve(window.__FRAMES__)
+      : reject(new Error('frames.js loaded but set no window.__FRAMES__'));
+    s.onerror = () => reject(new Error('frames.js not found'));
+    document.head.appendChild(s);
+  });
+}
+
+(async function () {
+  try {
+    let payload;
+    try {
+      const r = await fetch('frames.json', { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      payload = await r.json();
+    } catch (e) {
+      payload = await loadFramesJs();
+    }
+    if (!payload || !payload.meta || !payload.vocab || !payload.frames)
+      throw new Error('payload is missing meta / vocab / frames');
+    init(payload);
+  } catch (e) {
+    showError(e && e.message ? e.message : e);
+  }
+})();
+</script>
+</html>
